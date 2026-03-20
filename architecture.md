@@ -9,6 +9,10 @@ The solver reads a YAML input file, builds a FiPy mesh and equation, integrates
 forward in time using a fully implicit scheme, and writes requested outputs.
 The design is intentionally flat: a small number of plain Python modules,
 minimal class hierarchy, and no framework beyond FiPy and Pydantic.
+#### Design objectives / goals
+- Avoid redundant implementations by leveraging existing abstractions. In particular, explicit Python loops are minimized in favor of NumPy's vectorized operations and ufunc-based computations, improving performance and code clarity. All property callables therefore accept and return NumPy arrays, not bare Python floats, so that cell-wise field updates are fully vectorized.
+- No re-inventing the wheel. FiPy has almost everything needed. This project
+  should, therefore, be a thin wrapper around it to the extent possible. Exceptions should be minimum and justified.
 
 ---
 
@@ -19,7 +23,7 @@ heat1d/
 ├── main.py            # entry point — parse args, call run()
 ├── schema.py          # Pydantic input models (the spec document)
 ├── loader.py          # YAML → validated SimulationInput
-├── functions.py       # ScalarFunction → callable f(x)
+├── functions.py       # ScalarFunction → callable f(np.ndarray)
 ├── mesh.py            # build FiPy mesh from geometry config
 ├── material.py        # assemble cell-wise ρ, Cp, k, Q fields
 ├── solver.py          # time-stepping loop
@@ -55,25 +59,36 @@ The central utility. Every material property, BC parameter, and IC that is
 a `ScalarFunction` is converted into a plain Python callable.
 
 ```python
-def make_scalar_function(spec: ScalarFunction, base_dir: Path) -> Callable[[float], float]
+def make_scalar_function(spec: ScalarFunction, base_dir: Path) -> Callable[[np.ndarray], np.ndarray]
 ```
 
-- `ConstantFunction`  → `lambda x: spec.value`
-- `PolynomialFunction` → `numpy.polynomial.Polynomial(spec.coefficients)`
-- `PiecewiseFunction`  → loads TSV, selects columns, builds `scipy.interpolate.interp1d`
+All functions returned by `make_scalar_function` share the vectorized signature
+`f(x: np.ndarray) -> np.ndarray`. This ensures that updating N cell values in
+`material.py` requires no explicit Python loop — the callable is applied
+directly to the full temperature array. The caller is still responsible for
+passing the right physical quantity (T, t, or x), but that quantity must always
+be a NumPy array (a scalar wrapped in `np.atleast_1d` is acceptable).
+
+The three concrete backends all support this natively:
+
+- `ConstantFunction`   → `lambda x: np.full_like(x, spec.value, dtype=float)`
+- `PolynomialFunction` → `numpy.polynomial.Polynomial(spec.coefficients)`  
+  *(already vectorized — accepts and returns arrays)*
+- `PiecewiseFunction`  → loads TSV, selects columns, builds `scipy.interpolate.interp1d`  
+  *(already vectorized by default)*
 
 Column selection from TSV (1-based index or name):
 
 ```python
 def _load_tsv_columns(path, x_col, y_col) -> tuple[np.ndarray, np.ndarray]:
-    df = pd.read_csv(path, sep=r"\s+", comment="#", header=...)
-    # if x_col/y_col are int: use iloc[:, col-1]
-    # if str: use df[col_name]
+    data = np.genfromtxt(path, comments="#", names=True)
+    # if x_col/y_col are int: use data[data.dtype.names[col-1]]
+    # if str: use data[col_name]
 ```
 
-All functions returned by `make_scalar_function` have the same signature
-`f(scalar: float) -> float`. The caller is responsible for passing the right
-physical quantity (T, t, or x).
+`numpy.genfromtxt` with `names=True` supports both index-based and
+name-based column access without introducing a heavy dependency. `pandas` is
+**not** used anywhere in this codebase.
 
 **Extrapolation** is handled inside the returned callable by a thin wrapper
 that clamps/warns/raises before calling `interp1d`.
@@ -83,7 +98,7 @@ that clamps/warns/raises before calling `interp1d`.
 #### 3.3  `mesh.py`
 
 ```python
-def build_mesh(geometry: Geometry) -> fipy.CellVariable  # returns mesh + layer map
+def build_mesh(geometry: Geometry) -> tuple[fipy.Grid1D, np.ndarray]
 ```
 
 Returns two things:
@@ -131,6 +146,9 @@ class MaterialFields:
 
 At each nonlinear iteration, `update(T)` re-evaluates all property functions
 at current cell temperatures and writes the values into the FiPy variables.
+Because every callable returned by `functions.py` accepts a `np.ndarray`,
+`update(T)` passes `T.value` (a full cell array) directly to each function —
+no Python loop over individual cells is needed.
 
 **Interface conductivity** between cells of different layers uses harmonic mean
 of the two adjacent cell conductivities — FiPy's default face interpolation.
@@ -289,7 +307,7 @@ loader.py  ──►  SimulationInput (validated, all paths resolved)
     │
     ├──► mesh.py        →  fipy.Grid1D mesh + layer_id array
     │
-    ├──► functions.py   →  callable f(x) for every ScalarFunction
+    ├──► functions.py   →  vectorized callable f(np.ndarray) for every ScalarFunction
     │
     ├──► material.py    →  MaterialFields (FiPy CellVariable / FaceVariable)
     │
@@ -309,23 +327,25 @@ loader.py  ──►  SimulationInput (validated, all paths resolved)
 | `fipy`          | PDE discretisation and solve         | core                           |
 | `pydantic >= 2` | input validation                     | core                           |
 | `ruamel.yaml`   | YAML parsing                         | preserves comments             |
-| `numpy`         | arrays, polynomial evaluation        | core                           |
+| `numpy`         | arrays, polynomial evaluation, TSV loading | core                     |
 | `scipy`         | `interp1d` for piecewise functions   | core                           |
-| `pandas`        | TSV loading with flexible column sel | could be replaced with numpy   |
 | `h5py`          | HDF5 checkpoint read/write           | only needed if restart enabled |
 
-No other dependencies. In particular, no `sympy` or `numexpr` — the
-`expression` function type mentioned as advanced in the YAML template is
-deferred until needed.
+No other dependencies. In particular, no `pandas` (TSV loading is handled by
+`numpy.genfromtxt`), no `sympy`, and no `numexpr` — the `expression` function
+type mentioned as advanced in the YAML template is deferred until needed.
 
 ---
 
 ### 6. Key Design Decisions
 
-**Single scalar function interface.** Every property — whether constant,
-polynomial, or tabulated — is converted to a `Callable[[float], float]` by
-`functions.py`. The rest of the code never inspects the function type. This
-makes adding new function types (e.g. `expression`) a one-file change.
+**Vectorized array function interface.** Every property — whether constant,
+polynomial, or tabulated — is converted to a `Callable[[np.ndarray], np.ndarray]`
+by `functions.py`. All three backends (`Polynomial`, `interp1d`, and the
+constant wrapper) natively accept and return NumPy arrays. This means
+`material.py` passes the full cell temperature array to each property function
+in a single call, with no Python loop over cells, consistent with the
+vectorization goal stated in the Overview.
 
 **FiPy fields updated in-place.** `MaterialFields.update(T)` writes directly
 into the existing `CellVariable` and `FaceVariable` objects rather than
