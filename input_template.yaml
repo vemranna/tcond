@@ -1,0 +1,308 @@
+# ==============================================================================
+# 1D Transient Heat Conduction - Master Input File
+# Units: SI throughout (m, s, W, K, J, kg)
+#
+# Scalar functions of temperature, time, or position can be specified as:
+#   type: constant      → value: <float>
+#   type: polynomial    → coefficients: [a0, a1, a2, ...]  (a0 + a1*T + a2*T² + ...)
+#   type: piecewise     → file: <path>  (TSV, path relative to this file)
+#                         x_col / y_col : column index (1-based, like gnuplot) OR column name
+#                         defaults to x_col: 1, y_col: 2 if omitted
+#                         interpolation: linear | cubic | nearest
+#                         extrapolation: clamp | error | warn+clamp
+#
+# TSV file conventions:
+#   - Lines starting with # are comments
+#   - First non-comment line is treated as header if it contains non-numeric content
+#   - Columns separated by tabs (or whitespace)
+# ==============================================================================
+
+metadata:
+  title: "Steel-Ceramic bilayer quench"
+  author: "J. Smith"
+  date: "2025-03-19"
+  description: "Quench from 1200K, convective left BC, adiabatic right"
+
+# ------------------------------------------------------------------------------
+# GEOMETRY & MESH
+# Layers listed left-to-right (increasing x)
+# ------------------------------------------------------------------------------
+geometry:
+  layers:
+    - name: steel
+      material: steel_304
+      thickness: 0.01          # m
+      nodes: 20                # uniform spacing
+
+      # Alternative: explicit non-uniform spacing within the layer
+      # dx_list: [0.0008, 0.0006, 0.0004, 0.0002]   # left-to-right, must sum to thickness
+
+      # Optional geometric grading (stretch factor toward right face of layer)
+      # grading: 1.2
+
+    - name: ceramic_coat
+      material: yttria_psz
+      thickness: 0.0005
+      nodes: 10
+
+  interfaces:
+    # One entry per internal interface, left-to-right order.
+    # Omit entirely for perfect contact everywhere.
+    # contact_resistance in m²·K/W (= 1 / contact_conductance)
+    - between: [steel, ceramic_coat]
+      contact_resistance: 1.0e-4
+      # contact_conductance: 10000.0     # alternative — specify one or the other
+
+# ------------------------------------------------------------------------------
+# MATERIALS
+# ------------------------------------------------------------------------------
+materials:
+  steel_304:
+    density:
+      type: constant
+      value: 7900.0              # kg/m³
+
+    specific_heat:
+      type: polynomial
+      coefficients: [450.0, 0.20]   # Cp = 450 + 0.20*T  [J/kg·K]
+
+    thermal_conductivity:
+      type: piecewise
+      file: materials/steel_304_k.tsv
+      # x_col and y_col default to 1 and 2 — no need to specify for a simple two-column file
+      interpolation: linear
+      extrapolation: clamp
+
+    volumetric_heat_generation:
+      type: constant
+      value: 0.0                 # W/m³
+
+      # Examples of other forms:
+      # type: polynomial
+      # coefficients: [1.0e5, -50.0]    # Q(T) = 1e5 - 50*T
+
+      # type: piecewise
+      # file: materials/steel_304_q.tsv
+      # interpolation: linear
+      # extrapolation: clamp
+
+  yttria_psz:
+    density:
+      type: constant
+      value: 6050.0
+
+    specific_heat:
+      type: constant
+      value: 505.0
+
+    thermal_conductivity:
+      type: piecewise
+      file: materials/yttria_psz_k.tsv
+      interpolation: linear
+      extrapolation: clamp
+
+    volumetric_heat_generation:
+      type: constant
+      value: 0.0
+
+# ------------------------------------------------------------------------------
+# INITIAL CONDITIONS
+# ------------------------------------------------------------------------------
+initial_conditions:
+  type: uniform
+  value: 1200.0                  # K
+
+  # Spatially varying — polynomial in x:
+  # type: polynomial
+  # coefficients: [1200.0, -50000.0]    # T(x) = 1200 - 50000*x
+
+  # Spatially varying — from file:
+  # type: piecewise
+  # file: initial/T0_profile.tsv
+  # x_col: 1
+  # y_col: 2
+  # interpolation: linear
+
+  # Restart from checkpoint:
+  # type: restart
+  # file: restart/checkpoint_0050.hdf5
+
+# ------------------------------------------------------------------------------
+# BOUNDARY CONDITIONS
+#
+# Supported types:
+#   temperature  — Dirichlet.  T_wall(t)
+#   flux         — Neumann.    q(t) [W/m²], positive = into domain
+#   convection   — Robin.      q = htc(t) * (T_bulk(t) - T_wall)
+#   radiation    — q = emissivity * stefan_boltzmann * (T_env(t)^4 - T_wall^4)
+#   combined     — sum of any of the above (list under components:)
+#   adiabatic    — zero flux (explicit named type)
+#   scheduled    — switch BC type at specified times
+# ------------------------------------------------------------------------------
+boundary_conditions:
+  left:
+    type: convection
+    htc:
+      type: piecewise
+      file: bcs/left_boundary.tsv
+      x_col: 1                   # time_s  (1-based column index)
+      y_col: 2                   # htc_W_m2_K
+      interpolation: linear
+      extrapolation: clamp
+    T_bulk:
+      type: piecewise
+      file: bcs/left_boundary.tsv   # same file reused
+      x_col: 1                      # time_s
+      y_col: 3                      # T_bulk_K
+      interpolation: linear
+      extrapolation: clamp
+
+  right:
+    type: adiabatic
+
+  # ---------- further BC examples (uncomment to use) ----------
+
+  # Dirichlet:
+  # left:
+  #   type: temperature
+  #   value:
+  #     type: piecewise
+  #     file: bcs/left_T.tsv
+  #     interpolation: linear
+  #     extrapolation: clamp
+
+  # Prescribed flux:
+  # left:
+  #   type: flux
+  #   value:
+  #     type: constant
+  #     value: 50000.0            # W/m²
+
+  # Radiation only:
+  # right:
+  #   type: radiation
+  #   emissivity: 0.85
+  #   T_environment:
+  #     type: constant
+  #     value: 300.0              # K
+  #   stefan_boltzmann: 5.67e-8   # optional override
+
+  # Combined convection + radiation:
+  # right:
+  #   type: combined
+  #   components:
+  #     - type: convection
+  #       htc:
+  #         type: constant
+  #         value: 10.0
+  #       T_bulk:
+  #         type: constant
+  #         value: 300.0
+  #     - type: radiation
+  #       emissivity: 0.85
+  #       T_environment:
+  #         type: constant
+  #         value: 300.0
+
+  # Scheduled (BC type switches at specified times):
+  # left:
+  #   type: scheduled
+  #   schedule:
+  #     - until: 10.0             # s — use this BC up to t=10
+  #       bc:
+  #         type: flux
+  #         value:
+  #           type: constant
+  #           value: 0.0
+  #     - until: end              # use this BC for remainder
+  #       bc:
+  #         type: convection
+  #         htc:
+  #           type: constant
+  #           value: 500.0
+  #         T_bulk:
+  #           type: constant
+  #           value: 300.0
+
+# ------------------------------------------------------------------------------
+# SOLUTION CONTROLS
+# ------------------------------------------------------------------------------
+solution:
+  time:
+    total: 60.0                  # s  (use this OR max_steps, not both)
+    # max_steps: 1000
+    dt_initial: 0.01             # s
+    dt_min: 1.0e-6               # s — adaptive stepping floor
+    dt_max: 1.0                  # s — adaptive stepping ceiling
+    adaptive:
+      enabled: true
+      target_dT_per_step: 5.0   # K — target max nodal temperature change per step
+      safety_factor: 0.9        # dt_new = safety * dt * (target_dT / actual_dT)
+
+  nonlinear:                     # Picard iterations for T-dependent properties
+    max_iterations: 50
+    tolerance: 1.0e-6            # convergence criterion on solution change
+    tolerance_norm: L2           # L1 | L2 | Linf
+    tolerance_type: relative     # relative | absolute
+    under_relaxation: 0.7        # applied to T field update between iterations
+
+  solver:
+    type: LinearLUSolver         # LinearLUSolver | LinearPCGSolver | LinearGMRESSolver
+    # tolerance: 1.0e-10         # linear solver inner tolerance
+    # preconditioner: ILU        # for iterative solvers only
+
+# ------------------------------------------------------------------------------
+# OUTPUTS
+# ------------------------------------------------------------------------------
+outputs:
+  directory: results/            # all output written here, created if absent
+
+  node_history:
+    # T and heat flux vs. time at specified points + all interfaces + boundaries
+    enabled: true
+    file: node_history.tsv
+    nodes:
+      - label: steel_mid
+        x: 0.005                 # m — snapped to nearest mesh node, label used in header
+      - label: coat_mid
+        x: 0.0103
+    include_interfaces: true     # auto-add all material interface nodes
+    include_boundaries: true     # auto-add left and right boundary nodes
+    interval:
+      type: every_step
+      # type: every_n_steps
+      # n: 5
+      # type: every_dt
+      # dt: 0.1                  # s
+
+  spatial_profiles:
+    # Full T(x) and q(x) snapshots written as numbered TSV files
+    enabled: true
+    file_prefix: profile_        # → results/profile_00001.tsv, profile_00002.tsv ...
+    at_times: [1.0, 5.0, 10.0, 30.0, 60.0]    # s
+    # every_n_steps: 10
+    # every_dt: 5.0
+
+  energy_balance:
+    # Integrated fluxes: Q_in_left, Q_in_right, dU/dt, residual (should be ~0)
+    enabled: true
+    file: energy_balance.tsv
+    interval:
+      type: every_step
+
+  tecplot:
+    # Single ASCII .dat file, one ZONE per snapshot
+    enabled: true
+    file: solution.dat
+    format: ascii                # ascii | binary
+    interval:
+      type: every_n_steps
+      n: 10
+
+  checkpoint:
+    enabled: true
+    directory: restart/
+    interval:
+      type: every_n_steps
+      n: 100
+    keep_last_n: 3               # rolling window — older checkpoints deleted
